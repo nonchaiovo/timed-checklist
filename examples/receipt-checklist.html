@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipt Checklist — reference UI</title>
+<!--
+  Reference UI for the "Checklist with Timed Reminders" feature — a faithful,
+  self-contained copy of the production "receipt" checklist, INCLUDING its
+  bottom-sheet behaviour: it slides up from the bottom, opens at a default
+  height, and the top handle drags it between two snap heights.
+
+  See ../checklist-reminder.md for the data model + alarm pipeline.
+
+  Open in a browser: it renders with mock data and talks to no server. Every
+  spot a real API call belongs is marked `API:`.
+
+  ┌─ TO ADAPT ─────────────────────────────────────────────────────────────┐
+  │ 1. Fill in the two names + app name in the CONFIG block (JS, top).      │
+  │ 2. Wire the `API:` calls to your backend.                              │
+  │ 3. Tweak SNAPS / DEFAULT_SNAP for the drawer heights you want.          │
+  │ Render contract per item: { body, done, trigger_at, created_by, is_fixed }│
+  └────────────────────────────────────────────────────────────────────────┘
+-->
+<style>
+  :root {
+    --rc-paper:     #F0EBE0;                 /* warm off-white receipt paper */
+    --rc-ink:       #2A2620;
+    --rc-faded:     #86806E;
+    --rc-veryfaded: #BAB4A4;
+    --rc-rule:      rgba(60,50,40,0.32);
+    --rc-rule-soft: rgba(60,50,40,0.16);
+    --rc-stamp:     #A8362D;                  /* warm red accent */
+    --rc-overdue:   #C84A3F;
+    --rc-mono:  "SF Mono","JetBrains Mono","Menlo","Source Han Mono SC","Consolas",monospace;
+    --rc-serif: "Source Han Serif SC","Songti SC","STSong","PT Serif",Georgia,serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #cfc8bb; font-family: var(--rc-mono);
+    overflow: hidden;
+  }
+
+  /* a bare "host page" so the drawer has something to slide over */
+  .host { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .open-btn {
+    border: 1px solid var(--rc-rule); background: var(--rc-paper); color: var(--rc-ink);
+    font-family: var(--rc-mono); font-size: 13px; letter-spacing: 2px;
+    padding: 12px 22px; border-radius: 8px; cursor: pointer;
+    box-shadow: 0 4px 14px rgba(60,50,40,0.18);
+  }
+
+  /* ── scrim behind the sheet ── */
+  .scrim {
+    position: fixed; inset: 0; z-index: 90;
+    background: rgba(40,30,20,0.34);
+    opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
+  }
+  .scrim.open { opacity: 1; pointer-events: auto; }
+
+  /* ── the bottom sheet (drawer) ── */
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 95;
+    --ck-h: 62vh;                              /* current height, driven by drag */
+    height: var(--ck-h); max-height: 92vh;
+    background: var(--rc-paper);
+    background-image:
+      radial-gradient(ellipse at top, rgba(255,250,235,0.12) 0%, transparent 55%),
+      repeating-linear-gradient(90deg, rgba(60,40,20,0.012) 0, rgba(60,40,20,0.012) 1px, transparent 1px, transparent 2px);
+    /* zig-zag torn top edge (30 teeth, 8px), flat bottom */
+    clip-path: polygon(
+      0% 8px, 1.667% 0, 3.333% 8px, 5% 0, 6.667% 8px, 8.333% 0,
+      10% 8px, 11.667% 0, 13.333% 8px, 15% 0, 16.667% 8px, 18.333% 0,
+      20% 8px, 21.667% 0, 23.333% 8px, 25% 0, 26.667% 8px, 28.333% 0,
+      30% 8px, 31.667% 0, 33.333% 8px, 35% 0, 36.667% 8px, 38.333% 0,
+      40% 8px, 41.667% 0, 43.333% 8px, 45% 0, 46.667% 8px, 48.333% 0,
+      50% 8px, 51.667% 0, 53.333% 8px, 55% 0, 56.667% 8px, 58.333% 0,
+      60% 8px, 61.667% 0, 63.333% 8px, 65% 0, 66.667% 8px, 68.333% 0,
+      70% 8px, 71.667% 0, 73.333% 8px, 75% 0, 76.667% 8px, 78.333% 0,
+      80% 8px, 81.667% 0, 83.333% 8px, 85% 0, 86.667% 8px, 88.333% 0,
+      90% 8px, 91.667% 0, 93.333% 8px, 95% 0, 96.667% 8px, 98.333% 0,
+      100% 8px, 100% 100%, 0% 100%
+    );
+    box-shadow: 0 -8px 32px rgba(0,0,0,0.28), 0 1px 3px rgba(0,0,0,0.10);
+    transform: translateY(100%);
+    transition: transform 0.35s cubic-bezier(0.32,0.72,0,1),
+                height 0.28s cubic-bezier(0.32,0.72,0,1);
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .sheet.open { transform: translateY(0); }
+
+  .sheet-handle {
+    position: absolute; top: 14px; left: 0; right: 0; z-index: 5;
+    width: 44px; height: 5px; border-radius: 3px; margin: 0 auto;
+    background: var(--rc-faded); opacity: 0.4; cursor: grab; touch-action: none;
+  }
+  .sheet-handle::after { content: ""; position: absolute; left: -60px; right: -60px; top: -16px; bottom: -16px; }
+  .sheet-handle:active { cursor: grabbing; }
+
+  .rc-scroll {
+    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 46px 22px calc(env(safe-area-inset-bottom, 0px) + 20px);
+  }
+
+  /* ── receipt chrome ── */
+  .rc-head { text-align: center; margin-bottom: 10px; }
+  .rc-brand { font-size: 10px; color: var(--rc-faded); letter-spacing: 4px; font-weight: 700; }
+  .rc-title { font-family: var(--rc-serif); font-style: italic; font-size: 30px; font-weight: 700;
+    color: var(--rc-ink); margin-top: 4px; letter-spacing: 1px; line-height: 1.1; }
+  .rc-date { font-size: 11px; color: var(--rc-faded); margin-top: 6px; letter-spacing: 2px; }
+  .rc-dashes { font-size: 11px; color: var(--rc-rule); letter-spacing: 1px; text-align: center;
+    user-select: none; padding: 4px 0; white-space: nowrap; overflow: hidden; }
+  .rc-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--rc-ink);
+    letter-spacing: 0.5px; padding: 3px 0; }
+  .rc-row.faded { color: var(--rc-faded); }
+  .rc-section-label { text-align: center; font-size: 11px; color: var(--rc-faded);
+    letter-spacing: 3px; font-weight: 700; padding: 4px 0 10px; }
+
+  /* ── task rows: [ ]/[✓] + time badge (FRONT) + text + by + × ── */
+  .checklist-item { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0;
+    border-bottom: 0.5px dashed var(--rc-rule-soft); -webkit-tap-highlight-color: transparent; }
+  .checklist-check { flex: 0 0 auto; border: 0; background: transparent; padding: 0; margin: 0;
+    font-family: var(--rc-mono); font-size: 14px; color: var(--rc-ink); letter-spacing: 0.5px;
+    line-height: 1.45; cursor: pointer; transition: transform .12s ease; }
+  .checklist-check:active { transform: scale(0.85); }
+  .checklist-check::before { content: "[ ]"; }
+  .checklist-item.done .checklist-check::before { content: "[\2713]"; }
+
+  /* the timestamp badge — rendered BEFORE the task text */
+  .checklist-trigger { flex: 0 0 auto; align-self: flex-start; margin-top: 1px;
+    font-family: var(--rc-mono); font-size: 11.5px; letter-spacing: 0.4px; color: var(--rc-stamp);
+    padding: 0 5px; border: 0.5px solid var(--rc-rule-soft); border-radius: 3px; line-height: 1.6; }
+  /* overdue-but-not-done: a small "!" after the text (no highlight; item floats to top) */
+  .checklist-overdue-bang { flex: 0 0 auto; align-self: flex-start;
+    font-family: var(--rc-mono); font-size: 13.5px; font-weight: 700; color: var(--rc-stamp); line-height: 1.45; }
+
+  .checklist-body { flex: 1; min-width: 0; font-family: var(--rc-mono); font-size: 13.5px;
+    line-height: 1.45; letter-spacing: 0.2px; color: var(--rc-ink);
+    white-space: pre-wrap; word-break: break-word; outline: none; }
+  .checklist-item.done .checklist-body { color: var(--rc-veryfaded);
+    text-decoration: line-through; text-decoration-color: var(--rc-faded); }
+
+  .checklist-by { flex: 0 0 auto; font-style: italic; font-size: 11px; color: var(--rc-faded);
+    letter-spacing: 0.5px; line-height: 1.6; }
+  .checklist-del-x { flex: 0 0 auto; border: 0; background: transparent; cursor: pointer;
+    font-family: var(--rc-mono); font-size: 14px; color: var(--rc-veryfaded); line-height: 1.45; padding: 0 2px; }
+  .checklist-del-x::before { content: "\00d7"; }
+  .checklist-del-x:hover { color: var(--rc-stamp); }
+
+  .checklist-item-new { border-bottom: 0.5px dashed var(--rc-rule-soft); }
+  .checklist-item-new .checklist-body { color: var(--rc-faded); font-size: 13px; }
+  .checklist-item-new .checklist-body:empty::before { content: "+ 新增一项"; color: var(--rc-faded); }
+  .checklist-item-new .checklist-del-x, .checklist-item-new .checklist-check { visibility: hidden; }
+
+  .rc-progress-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 12px;
+    color: var(--rc-ink); letter-spacing: 0.5px; }
+  .rc-progress-bar { flex: 1; letter-spacing: -0.5px; overflow: hidden; white-space: nowrap; }
+  .rc-progress-pct { font-size: 11px; color: var(--rc-faded); }
+
+  .rc-stamp-wrap { text-align: center; padding: 14px 0 4px; }
+  .rc-stamp { display: inline-block; padding: 6px 14px; border: 2.5px solid var(--rc-stamp);
+    border-radius: 4px; color: var(--rc-stamp); font-family: var(--rc-serif); font-style: italic;
+    font-size: 14px; font-weight: 700; letter-spacing: 2px; transform: rotate(-4deg); opacity: 0.82; }
+  .rc-foot-note { text-align: center; padding: 8px 8px 0; font-family: var(--rc-serif);
+    font-style: italic; font-size: 13px; color: var(--rc-faded); line-height: 1.7; }
+  .rc-barcode { display: flex; align-items: flex-end; gap: 1px; justify-content: center; height: 38px; padding: 14px 0 4px; }
+  .rc-barcode i { display: block; background: var(--rc-ink); opacity: 0.85; }
+  .rc-barcode-serial { text-align: center; font-size: 10px; color: var(--rc-faded); letter-spacing: 3px; margin-top: 2px; }
+</style>
+</head>
+<body>
+  <div class="host"><button class="open-btn" id="open-btn">今日清单</button></div>
+
+  <div class="scrim" id="scrim"></div>
+
+  <div class="sheet" id="sheet">
+    <div class="sheet-handle" id="handle"></div>
+    <div class="rc-scroll">
+      <div class="rc-head">
+        <div class="rc-brand" id="rc-brand"></div>
+        <div class="rc-title">Today's Receipt</div>
+        <div class="rc-date" id="rc-date">—</div>
+      </div>
+
+      <div class="rc-dashes" id="rc-dashes-1"></div>
+      <div class="rc-row"><span>开店</span><span>00:00</span></div>
+      <div class="rc-row"><span>柜员</span><span id="rc-clerks">—</span></div>
+      <div class="rc-row"><span>此刻</span><span id="rc-now">—:—</span></div>
+      <div class="rc-row"><span>单据号</span><span id="rc-serial">#—</span></div>
+
+      <div class="rc-dashes" id="rc-dashes-2"></div>
+      <div class="rc-section-label">TODAY'S ORDER · <span id="rc-total-label">0</span> 项</div>
+
+      <div class="list" id="list"></div>
+
+      <div style="height:14px"></div>
+      <div class="rc-dashes" id="rc-dashes-3"></div>
+      <div class="rc-row"><span>小计</span><span id="rc-subtotal">0 项</span></div>
+      <div class="rc-row faded"><span>已结清</span><span id="rc-done">0 项</span></div>
+      <div class="rc-row"><span>未结清</span><span id="rc-undone">0 项</span></div>
+      <div class="rc-progress-row">
+        <span>进度</span>
+        <span class="rc-progress-bar" id="rc-progress-bar">░░░░░░░░░░░░░░░░░░</span>
+        <span class="rc-progress-pct" id="rc-progress-pct">0%</span>
+      </div>
+      <div class="rc-row faded"><span>零点结账</span><span id="rc-midnight">—:— 后</span></div>
+
+      <div class="rc-dashes" id="rc-dashes-4"></div>
+      <div class="rc-stamp-wrap"><span class="rc-stamp">PAID · 谢谢</span></div>
+      <div class="rc-foot-note" id="rc-foot"></div>
+      <div class="rc-barcode" id="rc-barcode"></div>
+      <div class="rc-barcode-serial" id="rc-barcode-serial"></div>
+    </div>
+  </div>
+
+<script>
+  // ╔═══════════════════════ CONFIG — fill these in ════════════════════════╗
+  const NAMES = {
+    user:      "YOU",       // ← your name
+    assistant: "PARTNER",   // ← your partner's name (the "added by" tag)
+  };
+  const APP_NAME = "YOUR-APP";
+
+  // Drawer heights (fraction of viewport). Sheet opens at DEFAULT_SNAP; the
+  // handle drags it and releases to the nearest SNAP. Live drag is clamped.
+  const SNAPS = [0.62, 0.90];        // default 62vh, drag up to 90vh
+  const DEFAULT_SNAP = 0.62;
+  const DRAG_MIN = 0.30, DRAG_MAX = 0.92;
+  // ╚════════════════════════════════════════════════════════════════════════╝
+
+  const $ = (id) => document.getElementById(id);
+  const now = Date.now();
+
+  // ── mock data (stands in for `GET /api/checklist`) ──
+  let ITEMS = [
+    { id: 1, body: "喝水",           done: 1, is_fixed: 1, created_by: "assistant", trigger_at: null },
+    { id: 2, body: "至少一顿有蔬菜",  done: 0, is_fixed: 1, created_by: "assistant", trigger_at: null },
+    { id: 3, body: "吃药",           done: 0, is_fixed: 0, created_by: "assistant", trigger_at: now - 40*60000 },  // overdue (stays in place)
+    { id: 4, body: "出门去牙医",      done: 0, is_fixed: 0, created_by: "user",      trigger_at: now + 95*60000 },
+    { id: 5, body: "叫她起床",        done: 0, is_fixed: 0, created_by: "assistant", trigger_at: tomorrowAt(7,0) },
+  ];
+  function tomorrowAt(hh, mm) { const d = new Date(); d.setHours(hh,mm,0,0);
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate()+1); return d.getTime(); }
+
+  // ── drawer: open / close / drag-to-resize ──
+  const sheet = $("sheet"), scrim = $("scrim");
+  function setHeight(snap, animate = true) {
+    sheet.style.transition = animate
+      ? "transform 0.35s cubic-bezier(0.32,0.72,0,1), height 0.28s cubic-bezier(0.32,0.72,0,1)"
+      : "transform 0.35s cubic-bezier(0.32,0.72,0,1)";
+    sheet.style.setProperty("--ck-h", (snap * 100) + "vh");
+  }
+  function openSheet() { setHeight(DEFAULT_SNAP, false); sheet.classList.add("open"); scrim.classList.add("open"); render(); }
+  function closeSheet() { sheet.classList.remove("open"); scrim.classList.remove("open"); }
+  $("open-btn").onclick = openSheet;
+  scrim.onclick = closeSheet;
+
+  (function setupDrag() {
+    const handle = $("handle");
+    let startY = null, startSnap = DEFAULT_SNAP;
+    const curSnap = () => { const v = sheet.style.getPropertyValue("--ck-h"); return v ? parseFloat(v)/100 : DEFAULT_SNAP; };
+    const applyLive = (h) => { sheet.style.transition = "none";
+      sheet.style.setProperty("--ck-h", (Math.max(DRAG_MIN, Math.min(DRAG_MAX, h))*100)+"vh"); };
+    const snapNearest = () => { const c = curSnap();
+      let best = SNAPS[0], bd = Math.abs(SNAPS[0]-c);
+      for (const s of SNAPS) { const d = Math.abs(s-c); if (d < bd) { best = s; bd = d; } }
+      setHeight(best, true); };
+
+    handle.addEventListener("touchstart", (e) => { startY = e.touches[0].clientY; startSnap = curSnap(); e.preventDefault(); }, { passive:false });
+    handle.addEventListener("touchmove",  (e) => { if (startY===null) return;
+      applyLive(startSnap - (e.touches[0].clientY - startY)/window.innerHeight); e.preventDefault(); }, { passive:false });
+    handle.addEventListener("touchend",   () => { if (startY===null) return; startY = null; snapNearest(); });
+    handle.addEventListener("mousedown",  (e) => { startY = e.clientY; startSnap = curSnap();
+      const mv = (ev) => applyLive(startSnap - (ev.clientY - startY)/window.innerHeight);
+      const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); startY = null; snapNearest(); };
+      document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up); e.preventDefault(); });
+  })();
+
+  // ── badge text: HH:MM today, else MM/DD HH:MM ──
+  function badgeText(ts) { const d = new Date(ts), n = new Date();
+    const hh = String(d.getHours()).padStart(2,"0"), mm = String(d.getMinutes()).padStart(2,"0");
+    return d.toDateString()===n.toDateString() ? `${hh}:${mm}`
+      : `${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")} ${hh}:${mm}`; }
+
+  // ── one row: check → TIME BADGE → body → by → × ──
+  function buildRow(it) {
+    const row = document.createElement("div");
+    row.className = "checklist-item" + (it.done ? " done" : "");
+    const check = document.createElement("button");
+    check.className = "checklist-check"; check.onclick = () => toggle(it); // API: POST /api/checklist/:id/toggle
+    row.appendChild(check);
+    if (it.trigger_at) { const t = document.createElement("span");
+      t.className = "checklist-trigger"; t.textContent = badgeText(it.trigger_at); row.appendChild(t); }
+    const body = document.createElement("div"); body.className = "checklist-body"; body.textContent = it.body; row.appendChild(body);
+    if (it.trigger_at && it.trigger_at <= Date.now() && !it.done) {   // overdue → small "!"
+      const bang = document.createElement("span"); bang.className = "checklist-overdue-bang"; bang.textContent = "!"; row.appendChild(bang);
+    }
+    if (it.created_by === "assistant") { const by = document.createElement("span");
+      by.className = "checklist-by"; by.textContent = NAMES.assistant; row.appendChild(by); }
+    const del = document.createElement("button");
+    del.className = "checklist-del-x"; del.onclick = () => remove(it); // API: DELETE /api/checklist/:id
+    row.appendChild(del);
+    return row;
+  }
+
+  // ── render: overdue-but-not-done floats to top (marked with a small "!"); rest keeps order ──
+  function render() {
+    const list = $("list"); list.innerHTML = "";
+    const t = Date.now();
+    const overdue = ITEMS.filter(x => x.trigger_at && x.trigger_at <= t && !x.done);
+    const rest    = ITEMS.filter(x => !(x.trigger_at && x.trigger_at <= t && !x.done));
+    [...overdue, ...rest].forEach(it => list.appendChild(buildRow(it)));
+    const nr = document.createElement("div");
+    nr.className = "checklist-item checklist-item-new";
+    nr.innerHTML = '<button class="checklist-check"></button><div class="checklist-body" contenteditable></div><button class="checklist-del-x"></button>';
+    // API: on Enter -> POST /api/checklist { body, created_by:"user", is_fixed:1 }
+    list.appendChild(nr);
+    renderChrome();
+  }
+
+  function renderChrome() {
+    const d = new Date();
+    const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,"0"), day = String(d.getDate()).padStart(2,"0");
+    const wd = ["周日","周一","周二","周三","周四","周五","周六"][d.getDay()];
+    const set = (id,v) => { const el=$(id); if (el) el.textContent = v; };
+    set("rc-brand", `${APP_NAME} · GENERAL STORE`);
+    set("rc-clerks", `${NAMES.assistant} · ${NAMES.user}`);
+    set("rc-foot", `今天也辛苦了，${NAMES.user}。\n零点之后，未结清的会自动清零。`);
+    set("rc-date", `${y} / ${m} / ${day} · ${wd}`);
+    set("rc-now", `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`);
+    const total = ITEMS.length, done = ITEMS.filter(x=>x.done).length, dayNum = String(total).padStart(3,"0");
+    set("rc-serial", `#${String(y).slice(2)}-${m}-${day}-${dayNum}`);
+    set("rc-total-label", String(total)); set("rc-subtotal", `${total} 项`);
+    set("rc-done", `${done} 项`); set("rc-undone", `${total-done} 项`);
+    const pct = total ? done/total : 0, w = 18, filled = Math.round(pct*w);
+    set("rc-progress-bar", "█".repeat(filled) + "░".repeat(w-filled)); set("rc-progress-pct", `${Math.round(pct*100)}%`);
+    const minsLeft = (24-d.getHours())*60 - d.getMinutes();
+    set("rc-midnight", `${String(Math.floor(minsLeft/60)).padStart(2,"0")}:${String(minsLeft%60).padStart(2,"0")} 后`);
+    const dash = "─ ".repeat(18).trim();
+    ["rc-dashes-1","rc-dashes-2","rc-dashes-3","rc-dashes-4"].forEach(id => set(id, dash));
+    const box = $("rc-barcode");
+    if (box && !box.dataset.built) {
+      const seed = [1,2,1,3,1,2,2,1,3,1,1,2,1,3,2,1,1,2,1,3,1,2,2,1,3,2,1,1,2,1,3,1,1,2,1,2];
+      box.innerHTML = seed.map((wpx,i)=>`<i style="width:${wpx}px;height:${i%5===0?38:32}px"></i>`).join("");
+      box.dataset.built = "1";
+    }
+    set("rc-barcode-serial", `${String(y).slice(2)} ${m} ${day} ${dayNum}`);
+  }
+
+  // ── actions (local-only; swap bodies for real fetch calls) ──
+  async function toggle(it) { it.done = it.done ? 0 : 1; render();
+    /* API: await fetch(`/api/checklist/${it.id}/toggle`, { method:"POST" }); */ }
+  async function remove(it) { ITEMS = ITEMS.filter(x => x.id !== it.id); render();
+    /* API: await fetch(`/api/checklist/${it.id}`, { method:"DELETE" }); */ }
+
+  // On a real client: `ITEMS = (await (await fetch("/api/checklist")).json()).items;`
+  // Auto-open once so the demo shows the drawer; drag the handle to resize.
+  render();
+  setTimeout(openSheet, 250);
+</script>
+</body>
+</html>
