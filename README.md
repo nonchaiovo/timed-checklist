@@ -1,45 +1,49 @@
-# Timed Checklist — a to-do list that wakes your assistant
+# Timed Checklist
 
-A daily checklist where **any item can carry a one-time timestamp**. When that
-time arrives, the backend **wakes your AI assistant and has it proactively
-message the user** — a real alarm, not just a passive due-date badge.
+一个每日清单,**任何一项都能挂一个一次性时间戳**。到点时,后端会**唤醒你的 AI,让其主动给用户发消息**——是真正的闹钟,不只是一个被动的"到期"小标记。
 
-Built for an assistant/companion app, but the design is backend-agnostic: a
-table, a small REST surface, and a once-a-minute tick.
+为人机恋而做,但设计与后端无关:一张表、一个很小的 REST 接口、一个每分钟跑一次的 tick,就够了。
 
-## What's here
+## 里面有什么
 
-- **[SPEC.md](SPEC.md)** — the full design: data model, time formats, REST API,
-  the alarm/wake pipeline (with an atomic-claim + retry pattern and a sequence
-  diagram), and the daily auto-clear rules. Written for **bring-your-own-frontend**
-  integrators.
-- **[examples/receipt-checklist.html](examples/receipt-checklist.html)** — a
-  self-contained reference UI (a "paper receipt" bottom-sheet). Open it directly
-  in a browser: it renders with mock data, drags between two snap heights, and
-  marks every spot where a real API call goes. Theme it with the `--rc-*` CSS
-  variables; fill in the two names in the CONFIG block.
+- **[SPEC.md](SPEC.md)** —— 完整设计:数据模型、时间格式、REST 接口、闹钟/唤醒管线(含"原子认领 + 失败重试"模式和时序图)、以及每日自动清除规则。**面向自带前端的接入方**。
+- **[examples/receipt-checklist.html](examples/receipt-checklist.html)** —— 一个自包含的参考 UI(纸质小票风格的底部抽屉)。浏览器直接打开:自带 mock 数据渲染、可在两档高度间拖拽、每处真实 API 调用位置都标了注释。用 `--rc-*` CSS 变量换肤;在 CONFIG 块里填两个名字即可。
 
-## The three item shapes
+## 三种清单项形态
 
-| Shape | Behavior |
+| 形态 | 行为 |
 |---|---|
-| **Fixed daily** | Recurs every day; un-checks at midnight. |
-| **One-off** | A task for today; cleared at midnight. |
-| **Timed reminder (alarm)** | Fires at its time (wakes the assistant → it messages the user). Done → cleared next midnight; not done → kept and floated to the top with a `!`. |
+| **固定日常** | 每天都在;零点自动取消勾选(整条保留)。 |
+| **一次性** | 只当天的任务;零点清除。 |
+| **定时提醒(闹钟)** | 到点触发(唤醒 AI → 它给用户发消息)。已完成 → 次日零点清除;未完成 → 保留、浮到顶部并带一个 `!`。 |
 
-## Setting a time (no epoch math)
+## 设定时间(不用算时间戳)
 
-A create payload takes any one of:
+创建时三选一:
 
 ```jsonc
-{ "body": "wake me up", "at": "07:00" }   // HH:MM today, or tomorrow if past
-{ "body": "stretch",    "in": 30 }        // N minutes from now
-{ "body": "…",          "trigger_at": 1783696800000 }  // absolute ms epoch
+{ "body": "叫我起床", "at": "07:00" }   // 今天 HH:MM,过了则算明天
+{ "body": "起来动动", "in": 30 }        // N 分钟后
+{ "body": "…",       "trigger_at": 1783696800000 }  // 绝对毫秒时间戳
 ```
 
-See **[SPEC.md](SPEC.md)** for the endpoints, the tick, and how to run the wake
-outside a CPU-metered cron.
+接口、tick、以及为什么要把唤醒放在 CPU 受限的 cron 之外跑,详见 **[SPEC.md](SPEC.md)**。
 
-## License
+## 改成你们的名字
 
-[MIT](LICENSE) — do whatever you want with it.
+参考 UI(`examples/receipt-checklist.html`)开头的 **CONFIG 块**里,改这三行就行:
+
+```js
+const NAMES = {
+  user:      "YOU",       // ← 你的名字
+  assistant: "PARTNER",   // ← 对象 / AI 的名字
+};
+const APP_NAME = "YOUR-APP";   // ← app 名(小票抬头)
+```
+
+改完保存,小票上的"柜员 XX · XX"、每项右边的署名、底部那句"今天也辛苦了,XX"就全跟着变。
+(真接进自己 app 时,名字就从你自己存用户信息的地方取,不用写死在这里。)
+
+## 许可
+
+[MIT](LICENSE) —— 随便用。
