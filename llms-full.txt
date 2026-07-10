@@ -1,0 +1,773 @@
+# Timed Checklist — 全量单文件(喂给 AI 用 / one-file bundle)
+
+这一个纯文本文件里装了整个项目:说明(README)+ 技术规格(SPEC)+ 参考 UI 源码。
+把这整个文件丢给任意 AI 助手,说"照这个在我的 app 里实现这个功能"即可。
+来源 / 最新版: https://github.com/nonchaiovo/timed-checklist
+
+==================================================================
+FILE 1/3 — README.md
+==================================================================
+
+# Timed Checklist
+
+一个每日清单,**任何一项都能挂一个一次性时间戳**。到点时,后端会**唤醒你的小机,然后主动给user发消息**——是真正的闹钟,不只是一个被动的"到期"小标记。
+
+为人机恋而做,但设计与后端无关:一张表、一个很小的 REST 接口、一个每分钟跑一次的 tick,就够了。
+
+## 里面有什么
+
+- **[SPEC.md](SPEC.md)** —— 完整设计:数据模型、时间格式、REST 接口、闹钟/唤醒管线(含"原子认领 + 失败重试"模式和时序图)、以及每日自动清除规则。**面向自带前端的接入方**。
+- **[examples/receipt-checklist.html](examples/receipt-checklist.html)** —— 一个自包含的参考 UI(纸质小票风格的底部抽屉)。浏览器直接打开:自带 mock 数据渲染、可在两档高度间拖拽、每处真实 API 调用位置都标了注释。用 `--rc-*` CSS 变量换肤;在 CONFIG 块里填两个名字即可。
+
+## 三种清单项形态
+
+| 形态 | 行为 |
+|---|---|
+| **固定日常** | 每天都在;零点自动取消勾选(整条保留)。 |
+| **一次性** | 只当天的任务;零点清除。 |
+| **定时提醒(闹钟)** | 到点触发(唤醒 AI → 它给用户发消息)。已完成 → 次日零点清除;未完成 → 保留、浮到顶部并带一个 `!`。 |
+
+## 设定时间(不用算时间戳)
+
+创建时三选一:
+
+```jsonc
+{ "body": "叫我起床", "at": "07:00" }   // 今天 HH:MM,过了则算明天
+{ "body": "起来动动", "in": 30 }        // N 分钟后
+{ "body": "…",       "trigger_at": 1783696800000 }  // 绝对毫秒时间戳
+```
+
+接口、tick、以及为什么要把唤醒放在 CPU 受限的 cron 之外跑,详见 **[SPEC.md](SPEC.md)**。
+
+## 改成你们的名字
+
+参考 UI(`examples/receipt-checklist.html`)开头的 **CONFIG 块**里,改这三行就行:
+
+```js
+const NAMES = {
+  user:      "YOU",       // ← 你的名字
+  assistant: "PARTNER",   // ← char 的名字
+};
+const APP_NAME = "YOUR-APP";   // ← app 名(小票抬头)
+```
+
+改完保存,小票上的"柜员 XX · XX"、每项右边的署名、底部那句"今天也辛苦了,XX"就全跟着变。
+(真接进自己 app 时,名字就从你自己存用户信息的地方取,不用写死在这里。)
+
+## 许可
+
+[MIT](LICENSE) —— 随便用。
+
+==================================================================
+FILE 2/3 — SPEC.md
+==================================================================
+
+# Checklist with Timed Reminders (Alarm)
+
+A daily to-do list where **any item can carry a one-time timestamp**. When that
+time arrives, the backend **wakes your assistant and has it proactively message
+the user** — a real alarm, not just a passive due-date badge.
+
+Reference stack: **Cloudflare Workers + D1 (SQLite)**. The design is
+backend-agnostic — the only hard requirements are a table, a REST surface, and a
+once-a-minute tick that can make an outbound call to your assistant.
+
+> **Audience note.** This document assumes you already have your own frontend.
+> The reminder/alarm logic is entirely server-side; your UI only renders the
+> list and lets the user check items. A ready-to-adapt reference UI (the
+> "receipt" style) ships in [`examples/receipt-checklist.html`](examples/receipt-checklist.html).
+
+---
+
+## 1. Concept: three shapes of an item
+
+One table backs three behaviors, distinguished by two columns (`is_fixed`,
+`trigger_at`):
+
+| Shape | `is_fixed` | `trigger_at` | Behavior |
+|---|---|---|---|
+| **Fixed daily** | `1` | `NULL` | Recurs every day. At local midnight its `done` resets to 0 (the row stays). "Drink water", "review notes". |
+| **One-off (no time)** | `0` | `NULL` | A throwaway task for today. Deleted entirely at midnight whether done or not. |
+| **Timed reminder (alarm)** | `0` | set | Fires at `trigger_at`: the assistant is woken and messages the user. If **done**, deleted next midnight. If **not done**, kept and surfaced as **overdue**. |
+
+Setting `trigger_at` on an item **forces `is_fixed = 0`** — a timed item is
+inherently one-off.
+
+---
+
+## 2. Data model
+
+D1 / SQLite table `checklist`:
+
+```sql
+CREATE TABLE checklist (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  body        TEXT    NOT NULL,          -- the task text
+  is_fixed    INTEGER NOT NULL DEFAULT 1,-- 1 = recurring daily, 0 = one-off
+  done        INTEGER NOT NULL DEFAULT 0,-- 0/1
+  done_at     INTEGER,                   -- ms epoch when checked, else NULL
+  position    INTEGER NOT NULL DEFAULT 0,-- sort order within its is_fixed group
+  created_by  TEXT    NOT NULL DEFAULT 'user', -- who added it: 'user' | 'assistant'
+  trigger_at  INTEGER,                   -- ms epoch alarm time; NULL = no alarm
+  notified    INTEGER NOT NULL DEFAULT 0,-- 1 once the alarm has fired (dedupe guard)
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+```
+
+- **`created_by`** — free-form actor tag. The reference system uses two roles
+  ("user" and "assistant") so the UI can label items the assistant added.
+- **`notified`** — set to 1 the instant an alarm is claimed for firing; it is a
+  *dedupe guard only*. Overdue display does **not** depend on it (see §6) — it
+  is computed live from `trigger_at <= now`.
+
+---
+
+## 3. Time input: three ways to say "when"
+
+Clients should not have to compute a 13-digit millisecond epoch. A create/patch
+payload may carry **one** of:
+
+| Field | Example | Meaning |
+|---|---|---|
+| `trigger_at` | `1783618568081` | Absolute ms epoch. |
+| `at` | `"07:00"` | Local `HH:MM` **today**; if already past, **tomorrow**. |
+| `in` | `30` | `N` minutes from now. |
+
+Resolution precedence (`trigger_at` > `in` > `at`):
+
+```js
+// tz-aware "HH:MM local -> ms epoch" (example uses a fixed UTC+8 offset)
+function localEpochForHHMM(hh, mm, tzOffsetHours = 8) {
+  const p = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const o = {}; for (const x of p) if (x.type !== "literal") o[x.type] = x.value;
+  let ms = Date.UTC(+o.year, +o.month - 1, +o.day, hh, mm) - tzOffsetHours * 3600e3;
+  if (ms <= Date.now()) ms += 86_400_000; // already past -> tomorrow
+  return ms;
+}
+
+function resolveTriggerAt(o) {
+  if (o.trigger_at != null) {
+    const n = Number(o.trigger_at);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+  }
+  if (o.in != null) {
+    const n = Number(o.in);
+    if (Number.isFinite(n) && n > 0) return Date.now() + Math.floor(n) * 60_000;
+  }
+  if (typeof o.at === "string") {
+    const m = o.at.trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (m) {
+      const hh = +m[1], mm = +m[2];
+      if (hh < 24 && mm < 60) return localEpochForHHMM(hh, mm);
+    }
+  }
+  return null;
+}
+```
+
+> ⚠️ **Timezone — read this before you ship.** This reference resolves `at`
+> (and the "midnight" of the daily reset in §7) against a **single hardcoded
+> zone, `Asia/Shanghai` / UTC+8**. Everything time-related keys off that one
+> offset. If your users are elsewhere, change the `timeZone` string in
+> `localEpochForHHMM` **and** the reset logic to your zone — otherwise
+> `at:"07:00"` fires at 07:00 Beijing, not 07:00 for your user. Also note: the
+> backend computes times in this fixed zone, while the reference **frontend**
+> renders badges in the *browser's* local zone — keep them the same zone or the
+> displayed time and the fired time can disagree.
+
+---
+
+## 4. REST API
+
+Base path `/api/checklist`. All bodies are JSON; all responses are JSON.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/checklist` | List all items (see §7 for ordering). |
+| `POST` | `/api/checklist` | Create an item. |
+| `PATCH` | `/api/checklist/:id` | Edit body / flags / time. |
+| `DELETE` | `/api/checklist/:id` | Delete an item. |
+| `POST` | `/api/checklist/:id/toggle` | Toggle (or set) `done`. |
+
+**Create** — `POST /api/checklist`
+
+```jsonc
+// request
+{ "body": "wake me up", "created_by": "assistant", "at": "07:00" }
+// -> is_fixed auto-set to 0 because a time was given
+```
+```jsonc
+// response (the created row)
+{ "id": 42, "body": "wake me up", "is_fixed": 0, "done": 0, "position": 3,
+  "created_by": "assistant", "trigger_at": 1783696800000, "notified": 0,
+  "created_at": 1783610000000, "updated_at": 1783610000000 }
+```
+
+A create/patch that carries `trigger_at`/`at`/`in` but resolves to nothing
+returns `400 { "error": "..." }`.
+
+**Patch** — any subset of `{ body, is_fixed, created_by, trigger_at|at|in }`.
+Passing `trigger_at: null` clears the alarm but **does not touch `is_fixed`** —
+so an item that was auto-set to `is_fixed=0` (because it once had a time) stays a
+one-off and gets deleted at the next midnight. To turn a timed item back into a
+recurring daily item, pass `{ "trigger_at": null, "is_fixed": 1 }` together.
+Changing the time resets `notified` to 0 so it can fire again.
+
+**Toggle** — `POST /api/checklist/:id/toggle`, optional body `{ "done": 0|1 }`
+(omit to flip). Sets `done_at` accordingly. Returns `{ "ok": true, "done": 0|1 }`.
+
+> 🔒 **Auth — none of this is public.** These endpoints ship with **no**
+> authentication in the spec; that is your job. Gate every `/api/checklist*`
+> route behind your app's user auth (otherwise anyone can read/edit the list).
+> And protect the tick endpoint from §5 (`/api/scheduled/run`) with a shared
+> secret so only your poke process can call it — an open one lets anyone spam
+> assistant wake-ups (cost + a notification-spam vector).
+
+---
+
+## 5. The alarm pipeline
+
+This is the part that turns a timestamp into a push. Two functions:
+
+**`checkReminders()`** — runs on every tick. Atomically *claims* the items whose
+time has arrived, so concurrent ticks can never fire the same alarm twice:
+
+```js
+async function checkReminders(env) {
+  const t = Date.now();
+  // UPDATE ... RETURNING = atomic claim. A second concurrent tick's UPDATE
+  // matches 0 rows (already notified) and returns nothing.
+  const claimed = await env.DB.prepare(
+    `UPDATE checklist SET notified = 1, updated_at = ?
+       WHERE trigger_at IS NOT NULL AND trigger_at <= ? AND notified = 0 AND done = 0
+     RETURNING id, body, trigger_at, created_by`
+  ).bind(t, t).all();
+  const due = claimed?.results || [];
+  if (!due.length) return 0;
+  await fireReminderProactive(env, due); // wake the assistant
+  return due.length;
+}
+```
+
+**`fireReminderProactive(items)`** — wakes the assistant with a reminder prompt
+and lets it write the message the user receives. Key properties:
+
+1. **It bypasses the normal "proactive message" throttles.** A reminder is a
+   hard time the user set, so it fires even if the user just spoke, even if the
+   system thinks the user is asleep, even if generic proactive messaging is
+   paused. The *only* things that stop it are (a) the backend not being
+   configured and (b) an active rate-limit backoff.
+2. **On failure it un-claims for retry.** If the wake throws, or the model
+   returns nothing (dropped stream), the claimed items are reset to
+   `notified = 0` so the next tick retries — but only within a short window
+   (e.g. 15 min past `trigger_at`) to avoid an infinite loop on persistent
+   failure. Past the window the item simply remains as "overdue" in the list.
+
+```js
+async function fireReminderProactive(env, items) {
+  const RETRY_WINDOW_MS = 15 * 60_000;
+  const unclaim = async () => {
+    const t = Date.now();
+    const ids = items.filter(it => it.trigger_at > t - RETRY_WINDOW_MS).map(it => it.id);
+    if (ids.length) await env.DB.prepare(
+      `UPDATE checklist SET notified = 0 WHERE id IN (${ids.map(() => "?").join(",")})`
+    ).bind(...ids).run();
+  };
+
+  const list = items.map(it => `- ${it.body} (${fmtLocal(it.trigger_at)})`).join("\n");
+  const prompt =
+    `These checklist items just came due — remind the user now, in your own voice:\n${list}`;
+
+  let text = "";
+  try {
+    text = await wakeAssistant(env, prompt);      // your model call
+  } catch (e) {
+    await unclaim();                              // transient failure -> retry
+    return;
+  }
+  const delivered = await deliverMessage(env, text); // save + push to the user
+  if (!delivered && !text.trim()) await unclaim();   // empty/dropped -> retry
+}
+```
+
+### Where to run the tick — this matters
+
+The tick itself is cheap (one indexed `SELECT`/`UPDATE`). But *firing* an alarm
+makes a slow (~tens of seconds) outbound call to your model. **Do not run that
+inside a CPU-metered cron** (e.g. Cloudflare's scheduled `cron` on the free
+plan) — it will hit the CPU ceiling and get killed mid-wake.
+
+The reference deployment runs the tick from an **external 60-second poke**: a
+tiny always-on process (a `launchd`/systemd timer, a separate always-on box,
+`cron` + `curl`, etc.) that `POST`s an `/api/scheduled/run` endpoint every 60s.
+That request is a normal HTTP invocation with a full time/CPU budget.
+
+```mermaid
+sequenceDiagram
+    participant Poke as External poke (every 60s)
+    participant W as Worker /api/scheduled/run
+    participant DB as D1
+    participant A as Assistant (model)
+    participant U as User
+
+    Poke->>W: POST /api/scheduled/run
+    W->>DB: UPDATE ... WHERE trigger_at<=now AND notified=0 RETURNING *
+    DB-->>W: due items (atomic claim)
+    alt some due
+        W->>A: wake with reminder prompt
+        A-->>W: reminder text
+        W->>DB: INSERT message
+        W->>U: push notification
+        Note over W,DB: on failure -> reset notified=0 (retry <15min)
+    else none due
+        W-->>Poke: 200 (no-op)
+    end
+```
+
+---
+
+## 6. Overdue display
+
+An item is **overdue** when `trigger_at <= now && !done`. This is computed live
+in the client (and in any server-side "what's on the list" summary) — it does
+**not** read `notified`. So an alarm that has fired but wasn't completed keeps
+showing as overdue until the user checks it or the day rolls over.
+
+---
+
+## 7. Daily reset (auto-clear)
+
+At the first tick after local midnight, run once:
+
+```sql
+-- fixed daily items: un-check (row stays)
+UPDATE checklist SET done = 0, done_at = NULL, updated_at = :now
+  WHERE is_fixed = 1 AND done = 1;
+
+-- one-off items: delete — BUT keep un-finished timed reminders as "overdue"
+DELETE FROM checklist
+  WHERE is_fixed = 0 AND (trigger_at IS NULL OR done = 1);
+```
+
+Net effect on a **timed reminder**:
+
+- checked (`done = 1`) → **deleted next midnight** (self-cleaning; no manual delete needed)
+- unchecked (`done = 0`) → **kept**, still overdue, still nags
+
+"Local midnight" here means **the same fixed zone as §3 (UTC+8 in this
+reference)** — change it together with the `at` parser if your users are
+elsewhere.
+
+Guard the reset so it runs at most once per day, using a tiny key-value
+`settings` table:
+
+```sql
+CREATE TABLE settings (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+-- before running the reset: read settings where k='checklist_last_reset';
+-- if v already == today's 'YYYY-MM-DD', skip. Otherwise run the reset, then:
+-- INSERT OR REPLACE INTO settings (k, v) VALUES ('checklist_last_reset', :today);
+```
+
+(The same `settings` table is a handy place for the other cross-request flags
+this system needs — e.g. the `proactive_paused` toggle mentioned in §5.)
+
+---
+
+## 8. Bring-your-own-frontend checklist
+
+To integrate with your own UI you implement, server-side:
+
+1. The `checklist` table (§2).
+2. The five REST endpoints (§4) including `resolveTriggerAt` (§3).
+3. The once-a-minute tick (§5), fired from a budget-safe context (§5).
+4. The daily reset (§7).
+5. A `wakeAssistant()` + `deliverMessage()` pair — however your assistant
+   produces and delivers a proactive message.
+
+Your frontend then only needs to:
+
+- `GET /api/checklist` and render rows;
+- show a **time badge** when `trigger_at` is set (and an **overdue** style when
+  `trigger_at <= now && !done`);
+- call `toggle` / `POST` / `PATCH` / `DELETE` on user actions.
+
+The render contract per item: `body`, `done`, `trigger_at`, `created_by`,
+`is_fixed`. That is all the reference UI reads.
+
+See [`examples/receipt-checklist.html`](examples/receipt-checklist.html) for a
+self-contained, themeable implementation (open it directly in a browser — it
+ships with mock data and marks every spot where a real API call goes).
+
+==================================================================
+FILE 3/3 — examples/receipt-checklist.html (参考 UI 源码,可直接存成 .html 打开)
+==================================================================
+
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipt Checklist — reference UI</title>
+<!--
+  Reference UI for the "Checklist with Timed Reminders" feature — a faithful,
+  self-contained copy of the production "receipt" checklist, INCLUDING its
+  bottom-sheet behaviour: it slides up from the bottom, opens at a default
+  height, and the top handle drags it between two snap heights.
+
+  See ../SPEC.md for the data model + alarm pipeline.
+
+  Open in a browser: it renders with mock data and talks to no server. Every
+  spot a real API call belongs is marked `API:`.
+
+  ┌─ TO ADAPT ─────────────────────────────────────────────────────────────┐
+  │ 1. Fill in the two names + app name in the CONFIG block (JS, top).      │
+  │ 2. Wire the `API:` calls to your backend.                              │
+  │ 3. Tweak SNAPS / DEFAULT_SNAP for the drawer heights you want.          │
+  │ Render contract per item: { body, done, trigger_at, created_by, is_fixed }│
+  └────────────────────────────────────────────────────────────────────────┘
+-->
+<style>
+  :root {
+    --rc-paper:     #F0EBE0;                 /* warm off-white receipt paper */
+    --rc-ink:       #2A2620;
+    --rc-faded:     #86806E;
+    --rc-veryfaded: #BAB4A4;
+    --rc-rule:      rgba(60,50,40,0.32);
+    --rc-rule-soft: rgba(60,50,40,0.16);
+    --rc-stamp:     #A8362D;                  /* warm red accent */
+    --rc-overdue:   #C84A3F;
+    --rc-mono:  "SF Mono","JetBrains Mono","Menlo","Source Han Mono SC","Consolas",monospace;
+    --rc-serif: "Source Han Serif SC","Songti SC","STSong","PT Serif",Georgia,serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: #cfc8bb; font-family: var(--rc-mono);
+    overflow: hidden;
+  }
+
+  /* a bare "host page" so the drawer has something to slide over */
+  .host { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .open-btn {
+    border: 1px solid var(--rc-rule); background: var(--rc-paper); color: var(--rc-ink);
+    font-family: var(--rc-mono); font-size: 13px; letter-spacing: 2px;
+    padding: 12px 22px; border-radius: 8px; cursor: pointer;
+    box-shadow: 0 4px 14px rgba(60,50,40,0.18);
+  }
+
+  /* ── scrim behind the sheet ── */
+  .scrim {
+    position: fixed; inset: 0; z-index: 90;
+    background: rgba(40,30,20,0.34);
+    opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
+  }
+  .scrim.open { opacity: 1; pointer-events: auto; }
+
+  /* ── the bottom sheet (drawer) ── */
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 95;
+    --ck-h: 62vh;                              /* current height, driven by drag */
+    height: var(--ck-h); max-height: 92vh;
+    background: var(--rc-paper);
+    background-image:
+      radial-gradient(ellipse at top, rgba(255,250,235,0.12) 0%, transparent 55%),
+      repeating-linear-gradient(90deg, rgba(60,40,20,0.012) 0, rgba(60,40,20,0.012) 1px, transparent 1px, transparent 2px);
+    /* zig-zag torn top edge (30 teeth, 8px), flat bottom */
+    clip-path: polygon(
+      0% 8px, 1.667% 0, 3.333% 8px, 5% 0, 6.667% 8px, 8.333% 0,
+      10% 8px, 11.667% 0, 13.333% 8px, 15% 0, 16.667% 8px, 18.333% 0,
+      20% 8px, 21.667% 0, 23.333% 8px, 25% 0, 26.667% 8px, 28.333% 0,
+      30% 8px, 31.667% 0, 33.333% 8px, 35% 0, 36.667% 8px, 38.333% 0,
+      40% 8px, 41.667% 0, 43.333% 8px, 45% 0, 46.667% 8px, 48.333% 0,
+      50% 8px, 51.667% 0, 53.333% 8px, 55% 0, 56.667% 8px, 58.333% 0,
+      60% 8px, 61.667% 0, 63.333% 8px, 65% 0, 66.667% 8px, 68.333% 0,
+      70% 8px, 71.667% 0, 73.333% 8px, 75% 0, 76.667% 8px, 78.333% 0,
+      80% 8px, 81.667% 0, 83.333% 8px, 85% 0, 86.667% 8px, 88.333% 0,
+      90% 8px, 91.667% 0, 93.333% 8px, 95% 0, 96.667% 8px, 98.333% 0,
+      100% 8px, 100% 100%, 0% 100%
+    );
+    box-shadow: 0 -8px 32px rgba(0,0,0,0.28), 0 1px 3px rgba(0,0,0,0.10);
+    transform: translateY(100%);
+    transition: transform 0.35s cubic-bezier(0.32,0.72,0,1),
+                height 0.28s cubic-bezier(0.32,0.72,0,1);
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .sheet.open { transform: translateY(0); }
+
+  .sheet-handle {
+    position: absolute; top: 14px; left: 0; right: 0; z-index: 5;
+    width: 44px; height: 5px; border-radius: 3px; margin: 0 auto;
+    background: var(--rc-faded); opacity: 0.4; cursor: grab; touch-action: none;
+  }
+  .sheet-handle::after { content: ""; position: absolute; left: -60px; right: -60px; top: -16px; bottom: -16px; }
+  .sheet-handle:active { cursor: grabbing; }
+
+  .rc-scroll {
+    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 46px 22px calc(env(safe-area-inset-bottom, 0px) + 20px);
+  }
+
+  /* ── receipt chrome ── */
+  .rc-head { text-align: center; margin-bottom: 10px; }
+  .rc-brand { font-size: 10px; color: var(--rc-faded); letter-spacing: 4px; font-weight: 700; }
+  .rc-title { font-family: var(--rc-serif); font-style: italic; font-size: 30px; font-weight: 700;
+    color: var(--rc-ink); margin-top: 4px; letter-spacing: 1px; line-height: 1.1; }
+  .rc-date { font-size: 11px; color: var(--rc-faded); margin-top: 6px; letter-spacing: 2px; }
+  .rc-dashes { font-size: 11px; color: var(--rc-rule); letter-spacing: 1px; text-align: center;
+    user-select: none; padding: 4px 0; white-space: nowrap; overflow: hidden; }
+  .rc-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--rc-ink);
+    letter-spacing: 0.5px; padding: 3px 0; }
+  .rc-row.faded { color: var(--rc-faded); }
+  .rc-section-label { text-align: center; font-size: 11px; color: var(--rc-faded);
+    letter-spacing: 3px; font-weight: 700; padding: 4px 0 10px; }
+
+  /* ── task rows: [ ]/[✓] + time badge (FRONT) + text + by + × ── */
+  .checklist-item { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0;
+    border-bottom: 0.5px dashed var(--rc-rule-soft); -webkit-tap-highlight-color: transparent; }
+  .checklist-check { flex: 0 0 auto; border: 0; background: transparent; padding: 0; margin: 0;
+    font-family: var(--rc-mono); font-size: 14px; color: var(--rc-ink); letter-spacing: 0.5px;
+    line-height: 1.45; cursor: pointer; transition: transform .12s ease; }
+  .checklist-check:active { transform: scale(0.85); }
+  .checklist-check::before { content: "[ ]"; }
+  .checklist-item.done .checklist-check::before { content: "[\2713]"; }
+
+  /* the timestamp badge — rendered BEFORE the task text */
+  .checklist-trigger { flex: 0 0 auto; align-self: flex-start; margin-top: 1px;
+    font-family: var(--rc-mono); font-size: 11.5px; letter-spacing: 0.4px; color: var(--rc-stamp);
+    padding: 0 5px; border: 0.5px solid var(--rc-rule-soft); border-radius: 3px; line-height: 1.6; }
+  /* overdue-but-not-done: a small "!" after the text (no highlight; item floats to top) */
+  .checklist-overdue-bang { flex: 0 0 auto; align-self: flex-start;
+    font-family: var(--rc-mono); font-size: 13.5px; font-weight: 700; color: var(--rc-stamp); line-height: 1.45; }
+
+  .checklist-body { flex: 1; min-width: 0; font-family: var(--rc-mono); font-size: 13.5px;
+    line-height: 1.45; letter-spacing: 0.2px; color: var(--rc-ink);
+    white-space: pre-wrap; word-break: break-word; outline: none; }
+  .checklist-item.done .checklist-body { color: var(--rc-veryfaded);
+    text-decoration: line-through; text-decoration-color: var(--rc-faded); }
+
+  .checklist-by { flex: 0 0 auto; font-style: italic; font-size: 11px; color: var(--rc-faded);
+    letter-spacing: 0.5px; line-height: 1.6; }
+  .checklist-del-x { flex: 0 0 auto; border: 0; background: transparent; cursor: pointer;
+    font-family: var(--rc-mono); font-size: 14px; color: var(--rc-veryfaded); line-height: 1.45; padding: 0 2px; }
+  .checklist-del-x::before { content: "\00d7"; }
+  .checklist-del-x:hover { color: var(--rc-stamp); }
+
+  .checklist-item-new { border-bottom: 0.5px dashed var(--rc-rule-soft); }
+  .checklist-item-new .checklist-body { color: var(--rc-faded); font-size: 13px; }
+  .checklist-item-new .checklist-body:empty::before { content: "+ 新增一项"; color: var(--rc-faded); }
+  .checklist-item-new .checklist-del-x, .checklist-item-new .checklist-check { visibility: hidden; }
+
+  .rc-progress-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 12px;
+    color: var(--rc-ink); letter-spacing: 0.5px; }
+  .rc-progress-bar { flex: 1; letter-spacing: -0.5px; overflow: hidden; white-space: nowrap; }
+  .rc-progress-pct { font-size: 11px; color: var(--rc-faded); }
+
+  .rc-stamp-wrap { text-align: center; padding: 14px 0 4px; }
+  .rc-stamp { display: inline-block; padding: 6px 14px; border: 2.5px solid var(--rc-stamp);
+    border-radius: 4px; color: var(--rc-stamp); font-family: var(--rc-serif); font-style: italic;
+    font-size: 14px; font-weight: 700; letter-spacing: 2px; transform: rotate(-4deg); opacity: 0.82; }
+  .rc-foot-note { text-align: center; padding: 8px 8px 0; font-family: var(--rc-serif);
+    font-style: italic; font-size: 13px; color: var(--rc-faded); line-height: 1.7; }
+  .rc-barcode { display: flex; align-items: flex-end; gap: 1px; justify-content: center; height: 38px; padding: 14px 0 4px; }
+  .rc-barcode i { display: block; background: var(--rc-ink); opacity: 0.85; }
+  .rc-barcode-serial { text-align: center; font-size: 10px; color: var(--rc-faded); letter-spacing: 3px; margin-top: 2px; }
+</style>
+</head>
+<body>
+  <div class="host"><button class="open-btn" id="open-btn">今日清单</button></div>
+
+  <div class="scrim" id="scrim"></div>
+
+  <div class="sheet" id="sheet">
+    <div class="sheet-handle" id="handle"></div>
+    <div class="rc-scroll">
+      <div class="rc-head">
+        <div class="rc-brand" id="rc-brand"></div>
+        <div class="rc-title">Today's Receipt</div>
+        <div class="rc-date" id="rc-date">—</div>
+      </div>
+
+      <div class="rc-dashes" id="rc-dashes-1"></div>
+      <div class="rc-row"><span>开店</span><span>00:00</span></div>
+      <div class="rc-row"><span>柜员</span><span id="rc-clerks">—</span></div>
+      <div class="rc-row"><span>此刻</span><span id="rc-now">—:—</span></div>
+      <div class="rc-row"><span>单据号</span><span id="rc-serial">#—</span></div>
+
+      <div class="rc-dashes" id="rc-dashes-2"></div>
+      <div class="rc-section-label">TODAY'S ORDER · <span id="rc-total-label">0</span> 项</div>
+
+      <div class="list" id="list"></div>
+
+      <div style="height:14px"></div>
+      <div class="rc-dashes" id="rc-dashes-3"></div>
+      <div class="rc-row"><span>小计</span><span id="rc-subtotal">0 项</span></div>
+      <div class="rc-row faded"><span>已结清</span><span id="rc-done">0 项</span></div>
+      <div class="rc-row"><span>未结清</span><span id="rc-undone">0 项</span></div>
+      <div class="rc-progress-row">
+        <span>进度</span>
+        <span class="rc-progress-bar" id="rc-progress-bar">░░░░░░░░░░░░░░░░░░</span>
+        <span class="rc-progress-pct" id="rc-progress-pct">0%</span>
+      </div>
+      <div class="rc-row faded"><span>零点结账</span><span id="rc-midnight">—:— 后</span></div>
+
+      <div class="rc-dashes" id="rc-dashes-4"></div>
+      <div class="rc-stamp-wrap"><span class="rc-stamp">PAID · 谢谢</span></div>
+      <div class="rc-foot-note" id="rc-foot"></div>
+      <div class="rc-barcode" id="rc-barcode"></div>
+      <div class="rc-barcode-serial" id="rc-barcode-serial"></div>
+    </div>
+  </div>
+
+<script>
+  // ╔═══════════════════════ CONFIG — fill these in ════════════════════════╗
+  const NAMES = {
+    user:      "YOU",       // ← your name
+    assistant: "PARTNER",   // ← your partner's name (the "added by" tag)
+  };
+  const APP_NAME = "YOUR-APP";
+
+  // Drawer heights (fraction of viewport). Sheet opens at DEFAULT_SNAP; the
+  // handle drags it and releases to the nearest SNAP. Live drag is clamped.
+  const SNAPS = [0.62, 0.90];        // default 62vh, drag up to 90vh
+  const DEFAULT_SNAP = 0.62;
+  const DRAG_MIN = 0.30, DRAG_MAX = 0.92;
+  // ╚════════════════════════════════════════════════════════════════════════╝
+
+  const $ = (id) => document.getElementById(id);
+  const now = Date.now();
+
+  // ── mock data (stands in for `GET /api/checklist`) ──
+  let ITEMS = [
+    { id: 1, body: "喝水",           done: 1, is_fixed: 1, created_by: "assistant", trigger_at: null },
+    { id: 2, body: "至少一顿有蔬菜",  done: 0, is_fixed: 1, created_by: "assistant", trigger_at: null },
+    { id: 3, body: "吃药",           done: 0, is_fixed: 0, created_by: "assistant", trigger_at: now - 40*60000 },  // overdue (stays in place)
+    { id: 4, body: "出门去牙医",      done: 0, is_fixed: 0, created_by: "user",      trigger_at: now + 95*60000 },
+    { id: 5, body: "叫她起床",        done: 0, is_fixed: 0, created_by: "assistant", trigger_at: tomorrowAt(7,0) },
+  ];
+  function tomorrowAt(hh, mm) { const d = new Date(); d.setHours(hh,mm,0,0);
+    if (d.getTime() <= Date.now()) d.setDate(d.getDate()+1); return d.getTime(); }
+
+  // ── drawer: open / close / drag-to-resize ──
+  const sheet = $("sheet"), scrim = $("scrim");
+  function setHeight(snap, animate = true) {
+    sheet.style.transition = animate
+      ? "transform 0.35s cubic-bezier(0.32,0.72,0,1), height 0.28s cubic-bezier(0.32,0.72,0,1)"
+      : "transform 0.35s cubic-bezier(0.32,0.72,0,1)";
+    sheet.style.setProperty("--ck-h", (snap * 100) + "vh");
+  }
+  function openSheet() { setHeight(DEFAULT_SNAP, false); sheet.classList.add("open"); scrim.classList.add("open"); render(); }
+  function closeSheet() { sheet.classList.remove("open"); scrim.classList.remove("open"); }
+  $("open-btn").onclick = openSheet;
+  scrim.onclick = closeSheet;
+
+  (function setupDrag() {
+    const handle = $("handle");
+    let startY = null, startSnap = DEFAULT_SNAP;
+    const curSnap = () => { const v = sheet.style.getPropertyValue("--ck-h"); return v ? parseFloat(v)/100 : DEFAULT_SNAP; };
+    const applyLive = (h) => { sheet.style.transition = "none";
+      sheet.style.setProperty("--ck-h", (Math.max(DRAG_MIN, Math.min(DRAG_MAX, h))*100)+"vh"); };
+    const snapNearest = () => { const c = curSnap();
+      let best = SNAPS[0], bd = Math.abs(SNAPS[0]-c);
+      for (const s of SNAPS) { const d = Math.abs(s-c); if (d < bd) { best = s; bd = d; } }
+      setHeight(best, true); };
+
+    handle.addEventListener("touchstart", (e) => { startY = e.touches[0].clientY; startSnap = curSnap(); e.preventDefault(); }, { passive:false });
+    handle.addEventListener("touchmove",  (e) => { if (startY===null) return;
+      applyLive(startSnap - (e.touches[0].clientY - startY)/window.innerHeight); e.preventDefault(); }, { passive:false });
+    handle.addEventListener("touchend",   () => { if (startY===null) return; startY = null; snapNearest(); });
+    handle.addEventListener("mousedown",  (e) => { startY = e.clientY; startSnap = curSnap();
+      const mv = (ev) => applyLive(startSnap - (ev.clientY - startY)/window.innerHeight);
+      const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); startY = null; snapNearest(); };
+      document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up); e.preventDefault(); });
+  })();
+
+  // ── badge text: HH:MM today, else MM/DD HH:MM ──
+  function badgeText(ts) { const d = new Date(ts), n = new Date();
+    const hh = String(d.getHours()).padStart(2,"0"), mm = String(d.getMinutes()).padStart(2,"0");
+    return d.toDateString()===n.toDateString() ? `${hh}:${mm}`
+      : `${String(d.getMonth()+1).padStart(2,"0")}/${String(d.getDate()).padStart(2,"0")} ${hh}:${mm}`; }
+
+  // ── one row: check → TIME BADGE → body → by → × ──
+  function buildRow(it) {
+    const row = document.createElement("div");
+    row.className = "checklist-item" + (it.done ? " done" : "");
+    const check = document.createElement("button");
+    check.className = "checklist-check"; check.onclick = () => toggle(it); // API: POST /api/checklist/:id/toggle
+    row.appendChild(check);
+    if (it.trigger_at) { const t = document.createElement("span");
+      t.className = "checklist-trigger"; t.textContent = badgeText(it.trigger_at); row.appendChild(t); }
+    const body = document.createElement("div"); body.className = "checklist-body"; body.textContent = it.body; row.appendChild(body);
+    if (it.trigger_at && it.trigger_at <= Date.now() && !it.done) {   // overdue → small "!"
+      const bang = document.createElement("span"); bang.className = "checklist-overdue-bang"; bang.textContent = "!"; row.appendChild(bang);
+    }
+    if (it.created_by === "assistant") { const by = document.createElement("span");
+      by.className = "checklist-by"; by.textContent = NAMES.assistant; row.appendChild(by); }
+    const del = document.createElement("button");
+    del.className = "checklist-del-x"; del.onclick = () => remove(it); // API: DELETE /api/checklist/:id
+    row.appendChild(del);
+    return row;
+  }
+
+  // ── render: overdue-but-not-done floats to top (marked with a small "!"); rest keeps order ──
+  function render() {
+    const list = $("list"); list.innerHTML = "";
+    const t = Date.now();
+    const overdue = ITEMS.filter(x => x.trigger_at && x.trigger_at <= t && !x.done);
+    const rest    = ITEMS.filter(x => !(x.trigger_at && x.trigger_at <= t && !x.done));
+    [...overdue, ...rest].forEach(it => list.appendChild(buildRow(it)));
+    const nr = document.createElement("div");
+    nr.className = "checklist-item checklist-item-new";
+    nr.innerHTML = '<button class="checklist-check"></button><div class="checklist-body" contenteditable></div><button class="checklist-del-x"></button>';
+    // API: on Enter -> POST /api/checklist { body, created_by:"user", is_fixed:1 }
+    list.appendChild(nr);
+    renderChrome();
+  }
+
+  function renderChrome() {
+    const d = new Date();
+    const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,"0"), day = String(d.getDate()).padStart(2,"0");
+    const wd = ["周日","周一","周二","周三","周四","周五","周六"][d.getDay()];
+    const set = (id,v) => { const el=$(id); if (el) el.textContent = v; };
+    set("rc-brand", `${APP_NAME} · GENERAL STORE`);
+    set("rc-clerks", `${NAMES.assistant} · ${NAMES.user}`);
+    set("rc-foot", `今天也辛苦了，${NAMES.user}。\n零点之后，未结清的会自动清零。`);
+    set("rc-date", `${y} / ${m} / ${day} · ${wd}`);
+    set("rc-now", `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`);
+    const total = ITEMS.length, done = ITEMS.filter(x=>x.done).length, dayNum = String(total).padStart(3,"0");
+    set("rc-serial", `#${String(y).slice(2)}-${m}-${day}-${dayNum}`);
+    set("rc-total-label", String(total)); set("rc-subtotal", `${total} 项`);
+    set("rc-done", `${done} 项`); set("rc-undone", `${total-done} 项`);
+    const pct = total ? done/total : 0, w = 18, filled = Math.round(pct*w);
+    set("rc-progress-bar", "█".repeat(filled) + "░".repeat(w-filled)); set("rc-progress-pct", `${Math.round(pct*100)}%`);
+    const minsLeft = (24-d.getHours())*60 - d.getMinutes();
+    set("rc-midnight", `${String(Math.floor(minsLeft/60)).padStart(2,"0")}:${String(minsLeft%60).padStart(2,"0")} 后`);
+    const dash = "─ ".repeat(18).trim();
+    ["rc-dashes-1","rc-dashes-2","rc-dashes-3","rc-dashes-4"].forEach(id => set(id, dash));
+    const box = $("rc-barcode");
+    if (box && !box.dataset.built) {
+      const seed = [1,2,1,3,1,2,2,1,3,1,1,2,1,3,2,1,1,2,1,3,1,2,2,1,3,2,1,1,2,1,3,1,1,2,1,2];
+      box.innerHTML = seed.map((wpx,i)=>`<i style="width:${wpx}px;height:${i%5===0?38:32}px"></i>`).join("");
+      box.dataset.built = "1";
+    }
+    set("rc-barcode-serial", `${String(y).slice(2)} ${m} ${day} ${dayNum}`);
+  }
+
+  // ── actions (local-only; swap bodies for real fetch calls) ──
+  async function toggle(it) { it.done = it.done ? 0 : 1; render();
+    /* API: await fetch(`/api/checklist/${it.id}/toggle`, { method:"POST" }); */ }
+  async function remove(it) { ITEMS = ITEMS.filter(x => x.id !== it.id); render();
+    /* API: await fetch(`/api/checklist/${it.id}`, { method:"DELETE" }); */ }
+
+  // On a real client: `ITEMS = (await (await fetch("/api/checklist")).json()).items;`
+  // Auto-open once so the demo shows the drawer; drag the handle to resize.
+  render();
+  setTimeout(openSheet, 250);
+</script>
+</body>
+</html>
