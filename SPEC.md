@@ -104,6 +104,16 @@ function resolveTriggerAt(o) {
 }
 ```
 
+> ⚠️ **Timezone — read this before you ship.** This reference resolves `at`
+> (and the "midnight" of the daily reset in §7) against a **single hardcoded
+> zone, `Asia/Shanghai` / UTC+8**. Everything time-related keys off that one
+> offset. If your users are elsewhere, change the `timeZone` string in
+> `localEpochForHHMM` **and** the reset logic to your zone — otherwise
+> `at:"07:00"` fires at 07:00 Beijing, not 07:00 for your user. Also note: the
+> backend computes times in this fixed zone, while the reference **frontend**
+> renders badges in the *browser's* local zone — keep them the same zone or the
+> displayed time and the fired time can disagree.
+
 ---
 
 ## 4. REST API
@@ -136,11 +146,21 @@ A create/patch that carries `trigger_at`/`at`/`in` but resolves to nothing
 returns `400 { "error": "..." }`.
 
 **Patch** — any subset of `{ body, is_fixed, created_by, trigger_at|at|in }`.
-Passing `trigger_at: null` clears the alarm (item becomes a plain one-off).
+Passing `trigger_at: null` clears the alarm but **does not touch `is_fixed`** —
+so an item that was auto-set to `is_fixed=0` (because it once had a time) stays a
+one-off and gets deleted at the next midnight. To turn a timed item back into a
+recurring daily item, pass `{ "trigger_at": null, "is_fixed": 1 }` together.
 Changing the time resets `notified` to 0 so it can fire again.
 
 **Toggle** — `POST /api/checklist/:id/toggle`, optional body `{ "done": 0|1 }`
 (omit to flip). Sets `done_at` accordingly. Returns `{ "ok": true, "done": 0|1 }`.
+
+> 🔒 **Auth — none of this is public.** These endpoints ship with **no**
+> authentication in the spec; that is your job. Gate every `/api/checklist*`
+> route behind your app's user auth (otherwise anyone can read/edit the list).
+> And protect the tick endpoint from §5 (`/api/scheduled/run`) with a shared
+> secret so only your poke process can call it — an open one lets anyone spam
+> assistant wake-ups (cost + a notification-spam vector).
 
 ---
 
@@ -273,8 +293,25 @@ Net effect on a **timed reminder**:
 - checked (`done = 1`) → **deleted next midnight** (self-cleaning; no manual delete needed)
 - unchecked (`done = 0`) → **kept**, still overdue, still nags
 
-Guard the reset with a `last_reset = YYYY-MM-DD` flag in a settings table so it
-runs at most once per day.
+"Local midnight" here means **the same fixed zone as §3 (UTC+8 in this
+reference)** — change it together with the `at` parser if your users are
+elsewhere.
+
+Guard the reset so it runs at most once per day, using a tiny key-value
+`settings` table:
+
+```sql
+CREATE TABLE settings (
+  k TEXT PRIMARY KEY,
+  v TEXT
+);
+-- before running the reset: read settings where k='checklist_last_reset';
+-- if v already == today's 'YYYY-MM-DD', skip. Otherwise run the reset, then:
+-- INSERT OR REPLACE INTO settings (k, v) VALUES ('checklist_last_reset', :today);
+```
+
+(The same `settings` table is a handy place for the other cross-request flags
+this system needs — e.g. the `proactive_paused` toggle mentioned in §5.)
 
 ---
 
