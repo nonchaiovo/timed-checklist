@@ -46,4 +46,6 @@ const APP_NAME = "YOUR-APP";   // ← app 名(小票抬头)
 
 ## 许可
 
-[MIT](LICENSE) —— 随便用。
+**非商用 · 署名 · 禁止再开源分发**（见 [LICENSE](LICENSE)）
+
+可以看、可以学、可以改着自己用——但不许拿去商用，不许以开源许可证再发布出去，用了请标明出处和作者 nonchaiovo。
